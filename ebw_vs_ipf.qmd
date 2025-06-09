@@ -1,0 +1,233 @@
+---
+title: "Entropy Balancing vs Iterative Proportional Fitting for Survey Weights"
+author: 
+  - name: "Betrouni"
+  - name: "Chesnut"
+  - name: "Eggleston"
+date: "2025-06-09"
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: true
+---
+
+> *An operational comparison of two calibration strategies: Entropy Balancing (EBW) and Iterative Proportional Fitting (IPF/raking).*\
+> **Objective:** Evaluate whether EBW, which solves the calibration in a single optimisation step, delivers **equal bias** but **smaller variance** than IPF while being easier to implement in day‑to‑day survey production.
+
+## Introduction
+
+Survey weights are routinely adjusted so that sample estimates align with known population totals.\
+Two common approaches are:
+
+-   **Iterative Proportional Fitting (IPF / raking)** – multiplicatively updates weights until the weighted totals match marginal targets.
+
+-   **Entropy Balancing Weighting (EBW)** – solves a constrained optimization that minimizes Kullback‑Leibler divergence from the starting weights while enforcing moment constraints in a *single* pass.
+
+In this Quarto HTLM output we illustrate both methods on a simulated dataset and compares their **Objective:** Evaluate whether EBW, which solves the calibration in a single optimisation step, delivers **equal bias** but **smaller variance** than IPF while being easier to implement in day‑to‑day survey production.
+
+## Setup
+
+All seeds and package versions are fixed so the analysis is fully reproducible.
+
+```{r}
+#| message: false
+#| warning: false
+# Clean workspace every time the document is rendered
+rm(list = ls())
+
+# Required packages -------------------------------------------------------
+pkgs <- c("ebal", "survey","ggplot2")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+
+library(ebal)     # Entropy balancing
+library(survey)   # Complex‑survey tools (incl. raking)
+library(knitr)    # Pretty tables for diagnostics
+library(ggplot2)
+
+
+```
+
+## Simulate a Sample and Specify Population Totals
+
+```{r}
+#| label: simulate-sample
+#| echo: true
+
+# -- 1 · Simulate sample ---------------------------------------------------
+
+set.seed(123)
+N_pop <- 150000        # population size
+n     <- 5000          # sample size
+inflate <- N_pop / n    # base sampling weight
+
+dat <- data.frame(
+  base_wt = inflate * runif(n, 0.7, 1.5),             # unequal‑probability design
+  age     = rnorm(n, 41, 12),         # numeric covariates
+  income  = rlnorm(n, 11, 0.5),
+  female  = rbinom(n, 1, 0.51),       # binary covariate
+  region  = sample(c("North", "South", "East", "West"),
+                   n, TRUE, prob = c(.25, .30, .20, .25))
+)
+```
+
+### Population control totals
+
+```{r}
+#| echo: true
+
+# -- 2 · Population targets -----------------------------------------------
+t_age    <- 42.3
+t_income <- 58000
+t_female <- 0.51
+t_reg_s  <- 0.30
+t_reg_e  <- 0.20
+t_reg_w  <- 0.25
+
+
+```
+
+## Entropy Balancing Weighting (EBW)
+
+**EBW can be peformed usign the ebal package in R**\
+\> `ebalance()` works by appending **one artificial “treatment” row** whose covariates equal the trusted population totals (Census, CPS, or other high-quality admin counts).\
+\> All genuine sample units have `Treatment = 0`; the pseudo-row is `1`.\
+\> The algorithm minimises Kullback–Leibler divergence from the base weights while matching the targets, stopping when either the maximum absolute imbalance falls below `constraint.tolerance` or `max.iterations` is reached.
+
+### Mathematical formulation
+
+Entropy balancing solves
+
+$$
+\begin{aligned}\min_{\mathbf{w}}\; & \sum_{i=1}^{n} w_i\,      \log\!\left(\tfrac{w_i}{d_i}\right) \\[4pt]\text{s.t.}\; & \sum_{i=1}^{n} w_i\,\mathbf{x}_i = \mathbf{t}, \\              & \sum_{i=1}^{n} w_i = N,\quad                w_i>0,\; i=1,\dots,n .\end{aligned}
+$$
+
+```{r}
+#| echo: true
+# Standardize continuous covariates (recommended for EBW stability)
+# -- 3 · Design matrix for EBW --------------------------------------------
+sd_age    <- sd(dat$age)
+sd_income <- sd(dat$income)
+age_s     <- dat$age    / sd_age
+income_s  <- dat$income / sd_income
+
+# Dummy matrix **in correct order** South - East - West
+reg_mm <- model.matrix(~ region - 1, dat)[ , c("regionSouth",
+                                               "regionEast",
+                                               "regionWest")]
+
+X_real <- cbind(age_s, income_s, female = dat$female, reg_mm)
+X_targ <- matrix(c(t_age / sd_age,
+                   t_income / sd_income,
+                   t_female,
+                   t_reg_s, t_reg_e, t_reg_w), nrow = 1,
+                 dimnames = list(NULL, colnames(X_real)))
+X_all  <- rbind(X_real, X_targ)
+Treat  <- c(rep(0, n), 1)
+
+eb <- ebalance(Treatment = Treat,
+               X         = X_all,
+               base.weight = dat$base_wt,
+               constraint.tolerance = 1e-10,
+               max.iterations = 10000)
+
+dat$eb_wt  <- eb$w * N_pop / sum(eb$w)   # EB inflation weights
+
+```
+
+## EBW
+
+::: callout-note **EBW at a glance**
+
+-   Achieved a precision of `r eb$maxdiff` .
+
+-   Adjustment‑factor range: **`r round(min(dat$eb_wt/dat$base_wt),2)`** to **`r round(max(dat$eb_wt/dat$base_wt),2)`**. :::
+
+## Iterative Proportional Fitting (Raking)
+
+```{r}
+#| echo: true
+# Add explicit dummy indicators in the data frame (needed for survey::calibrate)
+# -- 4 · Add the same dummies for IPF --------------------------------------
+dat$regionSouth <- reg_mm[, "regionSouth"]
+dat$regionEast  <- reg_mm[, "regionEast"]
+dat$regionWest  <- reg_mm[, "regionWest"]
+
+des <- svydesign(ids = ~1, weights = ~base_wt, data = dat)
+
+form_cal <- ~ -1 + age + income + female +      # -1 removes intercept
+  regionSouth + regionEast + regionWest
+
+pop_tot <- c(age         = t_age    * N_pop,
+             income      = t_income * N_pop,
+             female      = t_female * N_pop,
+             regionSouth = t_reg_s  * N_pop,
+             regionEast  = t_reg_e  * N_pop,
+             regionWest  = t_reg_w  * N_pop)
+
+des_rake <- calibrate(des, formula = form_cal,
+                      population = pop_tot,
+                      calfun = "raking",
+                      bounds = c(0.1,10))
+
+dat$ipf_wt <- weights(des_rake) * N_pop / sum(weights(des_rake))
+
+```
+
+## Verify moments matching
+
+```{r}
+
+
+wtcheck <- function(w) {
+  s <- sum(w)
+  c(age         = sum(w * dat$age)    / s,
+    income      = sum(w * dat$income) / s,
+    female      = sum(w * dat$female) / s,
+    regionSouth = sum(w * dat$regionSouth) / s,
+    regionEast  = sum(w * dat$regionEast)  / s,
+    regionWest  = sum(w * dat$regionWest)  / s)
+}
+
+pop_vec <- c(age = t_age, income = t_income, female = t_female,
+             regionSouth = t_reg_s, regionEast = t_reg_e, regionWest = t_reg_w)
+
+balance <- rbind(pop_target = pop_vec,
+                 EBW        = wtcheck(dat$eb_wt),
+                 IPF        = wtcheck(dat$ipf_wt))
+print(round(balance, 4))
+```
+
+## Diagnostics
+
+```{r}
+
+
+ratio_stats <- function(w) {
+  r <- w/dat$base_wt
+  c(min = min(r), p10 = quantile(r,.1), median = median(r),
+    p90 = quantile(r,.9), max = max(r),
+    CV = sd(r)/mean(r),
+    ESS = sum(r)^2 / sum(r^2))
+}
+
+print(round(rbind(EBW = ratio_stats(dat$eb_wt),
+                  IPF = ratio_stats(dat$ipf_wt)), 3))
+
+```
+
+### Visual compare of weight dispersion
+
+```{r}
+dat_long <- data.frame(
+  ratio  = c(dat$eb_wt/dat$base_wt, dat$ipf_wt/dat$base_wt),
+  method = rep(c("EBW","IPF"), each = nrow(dat))
+)
+
+ggplot(dat_long, aes(ratio)) +
+  geom_histogram(bins = 40, linewidth = 0.2) +
+  facet_wrap(~method, nrow = 1) +
+  labs(x = "Adjustment factor (new / base)",
+       y = "Count",
+       title = "Dispersion of weight adjustments")
+```
